@@ -19,47 +19,44 @@
 
 #include "newpack.h"
 
-#define BLOCK_SIZE 16*1024*1024
-#define HISTORY_BYTES -1
+#define HISTORY_DEPTH_DEFAULT 5
+#define MAX_BLOCK_SIZE 100000000
+#define DEF_BLOCK_SIZE 20000000
+#define MIN_BLOCK_SIZE 1000000
 
 static const char *usage = "\n"
-" NEWPACK  Experimental Lossless Compressor  Version 0.0.1\n"
+" NEWPACK  Experimental General-Purpose Lossless Compressor  Version 0.0.2\n"
 " Copyright (c) 2020 David Bryant. All Rights Reserved.\n\n"
-" Usage:   NEWPACK [-options] infile outfile\n"
+" Usage:   NEWPACK [-d] [-options] infile outfile\n"
 "           specify '-' for stdin or stdout\n\n"
-" Options: -d     = decompress\n"
-"          -h<n>  = history bytes (compress only, else find best)\n"
-"          -b<n>  = block size (compress only, default = 16 MB)\n"
+" Options: -d     = decompression (default is compression)\n"
+"          -a     = use all specialty modes (equivalent to -irn)\n"
+"          -[1-7] = probability model depth (default = 5 for 20 MB block)\n"
+"          -0     = no history employed in model (symbol frequency only)\n"
+"          -e     = exhaustive search (very slow for very little gain)\n"
+"          -i     = automatically detect interleave and use if better\n"
+"          -i<n>  = force specified interleave stride (1-16, default = 1)\n"
+"          -b<n>  = specify block size (1 MB - 100 MB, default = 20 MB)\n"
+"          -l     = use long blocks (100 MB; history depth set to -6)\n"
+"          -s     = use short blocks (4 MB; history depth set to -4)\n"
+"          -t     = use tiny blocks (1 MB; history depth set to -3)\n"
+"          -n     = try numerical data type preprocessing and use if better\n"
+"          -nn    = force numerical data type preprocessing (i.e., deltas)\n"
+"          -r     = try simple run-length encoding and use if better\n"
+"          -rr    = force simple run-length encoding (really just for testing)\n"
 "          -m     = decode random output based solely on model\n"
-"                   (works for the first block of file only)\n"
-"          -vv    = very verbose (include internal details)\n"
-"          -v     = verbose\n\n"
+"          -vv    = very verbose messaging (include internal details)\n"
+"          -v     = verbose messaging\n\n"
 " Warning: EXPERIMENTAL - DON'T EVEN THINK OF ARCHIVING WITH THIS!!\n";
-
-static int decompress (FILE *infile, FILE *outfile, FILE *verbose, int use_model_only)
-{
-    char preamble [12];
-
-    if (fread (preamble, 1, 12, infile) != 12 || strncmp (preamble, "newpack0.0", 10) ||
-        (preamble [10] != 'F') || (preamble [11] != '1')) {
-            fprintf (stderr, "not a valid newpack 0.0 file!\n");
-            return 1;
-    }
-
-    if (preamble [10] == 'F')
-        return newpack_decompress (infile, outfile, verbose, use_model_only);
-    else {
-        fprintf (stderr, "not a valid newpack 0.0 file!\n");
-        return 1;
-    }
-}
 
 int main (argc, argv) int argc; char **argv;
 {
-    int error_count = 0, decompress_mode = 0, history_bytes = HISTORY_BYTES, verbose = 0, use_model_only = 0;
+    int history_depth = HISTORY_DEPTH_DEFAULT, exhaustive_mode = 0, numerical_mode = 0, rle_mode = 0;
+    int error_count = 0, decompress_mode = 0, interleave = 1, verbose = 0, use_model_only = 0;
+    int history_depth_override = 0, block_size_override = 0;
     char *infilename = NULL, *outfilename = NULL;
+    int block_size = DEF_BLOCK_SIZE;
     FILE *infile, *outfile;
-    int block_size = BLOCK_SIZE;
 
     while (--argc) {
 #ifdef _WIN32
@@ -69,6 +66,16 @@ int main (argc, argv) int argc; char **argv;
 #endif
             while (*++*argv)
                 switch (**argv) {
+                    case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7':
+                        history_depth = **argv & HISTORY_DEPTH_MASK;
+                        history_depth_override = 1;
+                        break;
+
+                    case 'A': case 'a':
+                        interleave = INTERLEAVE_SEARCH;
+                        rle_mode = numerical_mode = 1;
+                        break;
+
                     case 'M': case 'm':
                         use_model_only = 1;
 
@@ -76,25 +83,67 @@ int main (argc, argv) int argc; char **argv;
                         decompress_mode = 1;
                         break;
 
+                    case 'E': case 'e':
+                        exhaustive_mode = 1;
+                        break;
+
+                    case 'R': case 'r':
+                        rle_mode++;
+                        break;
+
+                    case 'N': case 'n':
+                        numerical_mode++;
+                        break;
+
                     case 'B': case 'b':
-                        block_size = strtol (++*argv, argv, 10);
+                        block_size_override = block_size = strtol (++*argv, argv, 10);
                         --*argv;
 
-                        if (block_size < 1000 || block_size > 16*1024*1024) {
-                            fprintf (stderr, "block size must be 1KB - 16MB\n");
+                        if (block_size < MIN_BLOCK_SIZE)
+                            block_size *= 1000000;
+
+                        if (block_size < MIN_BLOCK_SIZE || block_size > MAX_BLOCK_SIZE) {
+                            fprintf (stderr, "block size must be 1MB - 100MB\n");
                             ++error_count;
                         }
 
                         break;
 
-                    case 'H': case 'h':
-                        history_bytes = strtol (++*argv, argv, 10);
+                    case 'I': case 'i':
+                        interleave = strtol (++*argv, argv, 10);
                         --*argv;
 
-                        if (history_bytes < 0 || history_bytes > 8) {
-                            fprintf (stderr, "history bytes must be 0 - 8\n");
+                        if (interleave < 0 || interleave > 16) {
+                            fprintf (stderr, "interleave must be 1 - 16\n");
                             ++error_count;
                         }
+
+                        break;
+
+                    case 'L': case 'l':
+                        if (!block_size_override)
+                            block_size = MAX_BLOCK_SIZE;
+
+                        if (!history_depth_override)
+                            history_depth = 6;
+
+                        break;
+
+                    case 'S': case 's':
+                        if (!block_size_override)
+                            block_size = 4000000;
+
+                        if (!history_depth_override)
+                            history_depth = 4;
+
+                        break;
+
+                    case 'T': case 't':
+                        if (!block_size_override)
+                            block_size = MIN_BLOCK_SIZE;
+
+                        if (!history_depth_override)
+                            history_depth = 3;
 
                         break;
 
@@ -103,7 +152,7 @@ int main (argc, argv) int argc; char **argv;
                         break;
 
                     default:
-                        fprintf (stderr, "illegal option: %c !", **argv);
+                        fprintf (stderr, "illegal option: %c !\n", **argv);
                         ++error_count;
                 }
         else if (!infilename)
@@ -111,7 +160,7 @@ int main (argc, argv) int argc; char **argv;
         else if (!outfilename)
             outfilename = *argv;
         else {
-            fprintf (stderr, "extra option: %s !", *argv);
+            fprintf (stderr, "extra option: %s !\n", *argv);
             error_count++;
         }
     }
@@ -125,7 +174,7 @@ int main (argc, argv) int argc; char **argv;
         infile = fopen (infilename, "rb");
 
         if (!infile) {
-            fprintf (stderr, "can't open %s for input", infilename);
+            fprintf (stderr, "can't open %s for input\n", infilename);
             return 1;
         }
     }
@@ -140,7 +189,7 @@ int main (argc, argv) int argc; char **argv;
         outfile = fopen (outfilename, "wb");
 
         if (!outfile) {
-            fprintf (stderr, "can't open %s for output", outfilename);
+            fprintf (stderr, "can't open %s for output\n", outfilename);
             return 1;
         }
     }
@@ -156,17 +205,33 @@ int main (argc, argv) int argc; char **argv;
 
         if (decompress_mode) {
             if (verbose) fprintf (stderr, "decompressing %s to %s ...\n", infilename, outfilename);
-            decompress (infile, outfile, verbose ? stderr : NULL, use_model_only);
+            newpack_decompress (infile, outfile, verbose ? stderr : NULL, use_model_only);
         }
         else {
+            int flags = history_depth;
             if (verbose) fprintf (stderr, "compressing %s to %s ...\n", infilename, outfilename);
-            newpack_compress (infile, outfile, verbose ? stderr : NULL, block_size, history_bytes, verbose > 1);
+
+            if (verbose > 1)
+                flags |= VERY_VERBOSE_FLAG;
+
+            if (exhaustive_mode)
+                flags |= EXHAUSTIVE_FLAG;
+
+            if (numerical_mode)
+                flags |= numerical_mode > 1 ? FORCE_NUM_FLAG : TRY_NUM_FLAG;
+
+            if (rle_mode)
+                flags |= rle_mode > 1 ? FORCE_RLE_FLAG : TRY_RLE_FLAG;
+
+            newpack_compress (infile, outfile, verbose ? stderr : NULL, block_size, interleave, flags);
         }
 
         fclose (infile);
         fclose (outfile);
 
-        if (verbose) fprintf (stderr, "processing time: %d seconds\n", (int)(time (NULL) - start_time));
+        if (verbose) fprintf (stderr, "compression time: %d seconds\n", (int)(time (NULL) - start_time));
     }
+
+    return 0;
 }
 

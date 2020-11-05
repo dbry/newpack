@@ -17,20 +17,22 @@
 // of data (like text).
 //
 // This implementation pre-scans each buffer of data to be compressed and
-// creates a probability model for each byte which is based on some number
-// of previous bytes in the stream. This model is compressed with simple
-// RLE schemes and sent to the output file, and then the actual data is
-// encoded using the model a range coder and sent last in the stream.
+// creates a probability model for each byte which is based on an up to
+// 24-bit hash of immediately previous bytes in the stream. This model
+// consists of a bitmask representing that hash values that are actually
+// encountered and a concatenation of the probability tables for each
+// encountered hash value. These two structures are recusively compressed
+// and sent to the output file. Then the actual data is encoded using the
+// model and a range coder and sent last in the stream.
 //
-// The model can incorporate from 0 to 8 previous bytes in the prediction,
-// however memory contraints limit the number that are actually practical.
-// For text files around 2-3 previous bytes are generally optimum, and for
-// binary files 1-2 bytes work best. Only if the file uses a very small
-// symbol set can 4 or more bytes be used successfully in the model.
+// To create the hash, each byte is converted to a new representation with
+// from 1 to 8 bits, and then these are concatenated into a 32-bit word
+// that is finally truncated to the desired size (1-24 bits). The codes are
+// reordered from most to least common to minimize collisions in the
+// hash.
 //
 // Because the model can become very large, better compression is achieved
 // with large blocks of data (assuming the data is somewhat homogeneous).
-// This version allows block sizes from 1 Kbyte to 16 Mbytes.
 
 #include <stdlib.h>
 #include <string.h>
@@ -38,423 +40,664 @@
 #include <fcntl.h>
 #include <math.h>
 
-#define MAX_BYTES_PER_BIN   1280    // maximum bytes for the value lookup array (per bin)
-                                    //  such that the total storage per bin = 2K (also
-                                    //  counting probabilities and summed_probabilities)
+#include "newpack.h"
 
-#define MAX_HISTORY_BINS    2097152 // determines ram footprint of histogram
-#define MAX_USED_BINS       65536   // determines ram footprint of probability tables (2K each on decode)
-#define MAX_PROBABILITY     0xA0    // set to 0xff to disable RLE encoding for probabilities table
-#define NO_COMPRESSION      0xFF    // send this for HISTORY_BITS to disable compression for block
+#if MAX_PROBABILITY > 0xFF
+typedef unsigned short prob_t;
+#else
+typedef unsigned char prob_t;
+#endif
 
-// #define CAPTURE_BINS_MASK
-// #define CAPTURE_PROB_TABLES
+static unsigned short log2linear [256], linear2log [MAX_PROBABILITY+1], tables_generated;
 
-static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, char history_bytes, unsigned char *code_map_ptr);
+static void generate_log_tables (void);
+static unsigned int checksum (void *data, int bcount);
+static int compress_buffer_best (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, int flags);
+static int compress_buffer_size (unsigned char *buffer, int num_samples, FILE *verbose, int hash_bits, int *history_bits, int *histogram, int flags);
+static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, int hash_bits, int *history_bits, int *histogram, int flags);
+static int decompress_interleave (unsigned char **input, int *input_size, unsigned char *output, int output_size, int use_model_only);
+static int decompress_buffer (unsigned char **input, int *input_size, unsigned char *output, int output_size, int use_model_only);
+static int rle_encode (void *input, int input_size, void *output);
+static int rle_decode (unsigned char **input, int *input_size, void *output, int output_size);
+static void interleave (void *buffer, int num_bytes, int stride, void *source);
+static void deinterleave (void *buffer, int num_bytes, int stride, void *source);
+static unsigned int hashed_code (unsigned int input_code, unsigned int num_hash_values);
+static int peak_interleave (unsigned char *buffer, int num_bytes, int max_interleave, FILE *verbose);
+static void convert2deltas (void *buffer, int byte_count);
+static void convert2sums (void *buffer, int byte_count);
 
-/*------------------------------------------------------------------------------------------------------------------------*/
 
-int newpack_compress (FILE *infile, FILE *outfile, FILE *verbose, int block_size, int history_bytes, int very_verbose)
+/* ----------------------------- compression --------------------------------*/
+
+int newpack_compress (FILE *infile, FILE *outfile, FILE *verbose, int block_size, int interleave, int flags)
 {
-    long long total_bytes_read = 0, total_bytes_written = 12;
+    int outbuffer_size = block_size + (block_size >> 3) + 65536, i;
+    char *outbuffer = malloc (outbuffer_size), *outbuffer2 = NULL;
+    FILE *details = (flags & VERY_VERBOSE_FLAG) ? verbose : NULL;
+    long long total_bytes_read = 0, total_bytes_written = 0;
     unsigned char *inbuffer = malloc (block_size);
-    FILE *details = very_verbose ? verbose : NULL;
+    int interleave_hits [MAX_INTERLEAVE] = { 0 };
+    int total_blocks = 0;
 
-    fwrite ("newpack0.0", 1, 10, outfile);
-    fputc ('F', outfile);
-    fputc ('1', outfile);
+    if (interleave == INTERLEAVE_SEARCH)
+        outbuffer2 = malloc (outbuffer_size);
+
+    generate_log_tables ();
+
+    if (interleave < 0 || interleave > MAX_INTERLEAVE)
+        interleave = 1;
+
+    if (interleave > 1)
+        while (block_size % interleave)
+            block_size--;
 
     while (1) {
-        int bytes_read = fread (inbuffer, 1, block_size, infile), bytes_written, bc;
-        unsigned char code_map [32], *bp = inbuffer;
-        int best_history_bytes = history_bytes;
+        int bytes_read = fread (inbuffer, 1, block_size, infile);
+        int interleave_to_use = interleave, interleave_size, interleave_outsize;
+        int outbytes = 0, straight_outbytes = 0, numeric_mode_count = 0;
+        int flags_to_use = flags;
 
         if (!bytes_read)
             break;
 
-        total_bytes_read += bc = bytes_read;
-        memset (code_map, 0, sizeof (code_map));
+        total_blocks++;
 
-        while (bc--) {
-            code_map [*bp >> 3] |= 1 << (*bp & 7);
-            bp++;
-        }
+        if (details)
+            fprintf (details, "\nblock %d containing %d bytes:\n", total_blocks, bytes_read);
 
-#if defined CAPTURE_BINS_MASK || defined CAPTURE_PROB_TABLES
-        int outbytes = bytes_read + (bytes_read << 1) + 65536;
-#else
-        int outbytes = bytes_read + (bytes_read >> 3) + 65536;
-#endif
-        char *outbuffer = malloc (outbytes);
+        if (interleave_to_use == INTERLEAVE_SEARCH)
+            interleave_to_use = peak_interleave (inbuffer, bytes_read, MAX_INTERLEAVE, details);
 
-        if (history_bytes == -1) {
-            char *trial_buffer = malloc (outbytes);
-            int trial_bytes;
+        total_bytes_read += bytes_read;
 
-            for (bytes_written = trial_bytes = 0; trial_bytes <= 8; ++trial_bytes) {
-                int trial_result = compress_buffer (inbuffer, bytes_read, trial_buffer, outbytes, details, trial_bytes, code_map);
+        if (interleave_to_use > 1 && bytes_read > interleave_to_use * 256) {
+            if (interleave == INTERLEAVE_SEARCH) {
 
-                if (!trial_result)
-                    continue;
+                if (flags & FORCE_NUM_FLAG) {
+                    convert2deltas (inbuffer, bytes_read);
+                    straight_outbytes = compress_buffer_best (inbuffer, bytes_read, outbuffer2, bytes_read + (bytes_read >> 3) + 65536, details, flags);
+                    convert2sums (inbuffer, bytes_read);
+                }
+                else {
+                    straight_outbytes = compress_buffer_best (inbuffer, bytes_read, outbuffer2, bytes_read + (bytes_read >> 3) + 65536, details, flags & ~TRY_NUM_FLAG);
 
-                if (!bytes_written || trial_result < bytes_written) {
-                    char *temp = outbuffer;
+                    if (flags & TRY_NUM_FLAG) {
+                        int numerical_outbytes;
 
-                    best_history_bytes = trial_bytes;
-                    bytes_written = trial_result;
-                    outbuffer = trial_buffer;
-                    trial_buffer = temp;
+                        convert2deltas (inbuffer, bytes_read);
+                        numerical_outbytes = compress_buffer_best (inbuffer, bytes_read, outbuffer, bytes_read + (bytes_read >> 3) + 65536, details,
+                            (flags & HISTORY_DEPTH_MASK) ? flags - 1 : flags);
+                        convert2sums (inbuffer, bytes_read);
 
-                    if (trial_result + 1000 < outbytes)
-                        outbytes = trial_result + 1000;
+                        if (numerical_outbytes < straight_outbytes) {
+                            char *temp = outbuffer2;
+                            outbuffer2 = outbuffer;
+                            outbuffer = temp;
+                            straight_outbytes = numerical_outbytes;
+                            numeric_mode_count++;
+                        }
+                    }
                 }
             }
 
-            free (trial_buffer);
+            deinterleave (inbuffer, bytes_read, interleave_to_use, NULL);
+
+            if (flags_to_use & HISTORY_DEPTH_MASK)
+                flags_to_use--;
+
+            if (interleave_to_use > 10 && (flags_to_use & HISTORY_DEPTH_MASK))
+                flags_to_use--;
         }
         else
-            while (1) { 
-                bytes_written = compress_buffer (inbuffer, bytes_read, outbuffer, outbytes, details, best_history_bytes, code_map);
+            interleave_to_use = 1;
 
-                if (bytes_written)
-                    break;
-                else if (best_history_bytes)
-                    best_history_bytes--;
-                else {
-                    fprintf (stderr, "fatal encoding error, compress_buffer() always returns zero!\n");
-                    break;
-                }
+        interleave_size = bytes_read / interleave_to_use;
+        interleave_outsize = interleave_size + (interleave_size >> 3) + 65536;
+
+        char *outbuffer3 = NULL;
+
+        if (flags & TRY_NUM_FLAG)
+            outbuffer3 = malloc (interleave_outsize);
+
+        for (i = 0; i < interleave_to_use; ++i) {
+            int bytes_to_process = (i < interleave_to_use - 1) ? interleave_size : bytes_read - interleave_size * i;
+            int straight_outsize, numerical_outsize;
+
+            if (flags & FORCE_NUM_FLAG) {
+                convert2deltas (inbuffer + interleave_size * i, bytes_to_process);
+                outbytes += straight_outsize = compress_buffer_best (inbuffer + interleave_size * i, bytes_to_process,
+                    outbuffer + outbytes, outbuffer_size - outbytes, details, flags_to_use);
             }
+            else {
+                straight_outsize = compress_buffer_best (inbuffer + interleave_size * i, bytes_to_process,
+                    outbuffer + outbytes, outbuffer_size - outbytes, details, flags_to_use & ~TRY_NUM_FLAG);
 
-        total_bytes_written += fwrite (outbuffer, 1, bytes_written, outfile);
-        free (outbuffer);
+                if (flags & TRY_NUM_FLAG) {
+                    convert2deltas (inbuffer + interleave_size * i, bytes_to_process);
+                    numerical_outsize = compress_buffer_best (inbuffer + interleave_size * i, bytes_to_process,
+                        outbuffer3, interleave_outsize, details, (flags & HISTORY_DEPTH_MASK) ? flags - 1 : flags);
+
+                    if (numerical_outsize < straight_outsize) {
+                        memcpy (outbuffer + outbytes, outbuffer3, numerical_outsize);
+                        outbytes += numerical_outsize;
+                        numeric_mode_count++;
+                    }
+                    else
+                        outbytes += straight_outsize;
+                }
+                else
+                    outbytes += straight_outsize;
+            }
+        }
+
+        free (outbuffer3);
+
+        if (details) {
+            if (straight_outbytes)
+                fprintf (details, "interleaved(%d) = %d (depth=%d), straight = %d (depth=%d), ratio = %.2f%%\n",
+                    interleave_to_use, outbytes, flags_to_use & HISTORY_DEPTH_MASK, straight_outbytes,
+                    flags & HISTORY_DEPTH_MASK, outbytes * 100.0 / straight_outbytes);
+            else if (interleave_to_use != 1)
+                fprintf (details, "interleaved(%d) = %d (depth=%d)\n",
+                    interleave_to_use, outbytes, flags_to_use & HISTORY_DEPTH_MASK);
+
+            if (flags & TRY_NUM_FLAG)
+                fprintf (details, "numeric mode used %d of %d times\n", numeric_mode_count,
+                    interleave_to_use + (interleave_to_use > 1 && interleave == INTERLEAVE_SEARCH));
+        }
+
+        total_bytes_written += fwrite ("newpack0.2", 1, 10, outfile);
+        total_bytes_written += fwrite (&bytes_read, 1, sizeof (bytes_read), outfile);
+
+        if (straight_outbytes && straight_outbytes < outbytes) {
+            straight_outbytes++;
+            total_bytes_written += fwrite (&straight_outbytes, 1, sizeof (straight_outbytes), outfile);
+            fputc (1, outfile);
+            total_bytes_written++;
+            total_bytes_written += fwrite (outbuffer2, 1, straight_outbytes - 1, outfile);
+            interleave_hits [0]++;
+        }
+        else {
+            outbytes++;
+            total_bytes_written += fwrite (&outbytes, 1, sizeof (outbytes), outfile);
+            fputc (interleave_to_use, outfile);
+            total_bytes_written++;
+            total_bytes_written += fwrite (outbuffer, 1, outbytes - 1, outfile);
+            interleave_hits [interleave_to_use - 1]++;
+        }
     }
 
-    free (inbuffer);
+    if (details) fprintf (details, "\n");
 
-    if (verbose) fprintf (verbose, "compression complete: %lld bytes --> %lld bytes (%.2f%%)\n",
-        total_bytes_read, total_bytes_written, total_bytes_written * 100.0 / total_bytes_read);
+    if (details && interleave == INTERLEAVE_SEARCH) {
+        if (interleave_hits [0]) fprintf (details, "interleave not applied in %d of %d blocks\n", interleave_hits [0], total_blocks);
+        for (i = 1; i < MAX_INTERLEAVE; ++i)
+            if (interleave_hits [i])
+                fprintf (details, "interleave stride of %d applied in %d of %d blocks\n", i+1, interleave_hits [i], total_blocks);
+    }
+
+    if (verbose) fprintf (verbose, "compression complete: %lld bytes --> %lld bytes (%.2f%%), %d blocks used\n",
+        total_bytes_read, total_bytes_written, total_bytes_written * 100.0 / total_bytes_read, total_blocks);
+
+    free (inbuffer);
+    free (outbuffer);
+    free (outbuffer2);
 
     return 0;
 }
 
-#if (MAX_PROBABILITY < 0xff)
-
-// 0x00                     = terminate (pad with zeros)
-// 0x01 - MAX_PROBABILITY   = non-zero probability values
-// MAX_PROBABILITY+1 - 0xFF = zero count + MAX_PROBABILITY
-
-static int rle_encode_bytes (unsigned char *src, int bcount, char *outfile)
+static int compress_buffer_best (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, int flags)
 {
-    int max_rle_zeros = 0xff - MAX_PROBABILITY;
-    int outbytes = 0, zcount = 0;
+    int bytes_written, history_bits = 0, hash_bits, rle_encode_bytes = 0;
+    int num_codes = 0, bc = num_samples;
+    unsigned char *bp = buffer;
+    char *outp = outbuffer;
+    int histogram [256];
 
-    while (bcount--) {
-        if (*src) {
-            while (zcount) {
-                if (outfile) *outfile++ = MAX_PROBABILITY + (zcount > max_rle_zeros ? max_rle_zeros : zcount);
-                zcount -= (zcount > max_rle_zeros ? max_rle_zeros : zcount);
-                outbytes++;
+    outp++;         // reserve first byte for flags
+    outbytes--;
+
+    if (flags & RLE_FLAGS) {
+        rle_encode_bytes = rle_encode (buffer, num_samples, NULL);
+
+        if (rle_encode_bytes > outbytes)
+            rle_encode_bytes = 0;
+
+        if (flags & FORCE_RLE_FLAG) {
+            if (rle_encode_bytes) {
+                if (outbuffer) {
+                    rle_encode (buffer, num_samples, outp);
+                    outp [-1] = flags;
+                }
+
+                return rle_encode_bytes + 1;
             }
-
-            if (outfile) *outfile++ = *src++; else src++;
-            outbytes++;
-        }
-        else {
-            zcount++;
-            src++;
+            else
+                return 0;
         }
     }
 
-    while (zcount) {
-        if (outfile) *outfile++ = MAX_PROBABILITY + (zcount > max_rle_zeros ? max_rle_zeros : zcount);
-        zcount -= (zcount > max_rle_zeros ? max_rle_zeros : zcount);
-        outbytes++;
-    }
+    memset (histogram, 0, sizeof (histogram));
 
-    if (outfile) *outfile++ = 0;
-    outbytes++;
+    while (bc--)
+        if (!histogram [*bp++]++)
+            num_codes++;
 
-    return outbytes;
-}
+    if (outbuffer && !(flags & HISTORY_DEPTH_MASK))
+        bytes_written = compress_buffer (buffer, num_samples, outp, outbytes, NULL, 0, &history_bits, histogram, flags & ~NUM_FLAGS);
+    else
+        bytes_written = compress_buffer_size (buffer, num_samples, NULL, 0, &history_bits, histogram, flags & ~NUM_FLAGS);
 
-#endif
-
-// 0x00        = terminate (pad with zeros)
-// 0x01 - 0xFE = 0 to 253 zeros followed by one
-// 0xFF        = 254 zeros (and no one)
-
-static int rle_encode_bits (unsigned char *src, int bcount, char *outfile)
-{
-    int outbytes = 0, zcount = 0, index = 0;
-
-    for (index = 0; index < bcount << 3; ++index)
-        if (src [index >> 3] & (1 << (index & 7))) {
-            while (zcount >= 254) {
-                if (outfile) *outfile++ = 0xFF;
-                zcount -= 254;
-                outbytes++;
+    if (!(flags & HISTORY_DEPTH_MASK)) {
+        if (rle_encode_bytes && rle_encode_bytes <= bytes_written) {
+            if (outbuffer) {
+                rle_encode (buffer, num_samples, outp);
+                outp [-1] = flags;
             }
 
-            if (outfile) *outfile++ = zcount + 1;
-            outbytes++;
-            zcount = 0;
+            if (verbose) fprintf (verbose, "rle encoding used, %d bytes <= %d bytes\n", rle_encode_bytes, bytes_written);
+            return rle_encode_bytes + 1;
         }
-        else
-            zcount++;
 
-    if (outfile) *outfile++ = 0;
-    outbytes++;
+        if (verbose && rle_encode_bytes)
+            fprintf (verbose, "rle encoding not used, %d bytes > %d bytes\n", rle_encode_bytes, bytes_written);
 
-    return outbytes;
+        if (outbuffer)
+            outp [-1] = flags & ~RLE_FLAGS;
+
+        return bytes_written + 1;
+    }
+
+    if (!bytes_written) {
+        fprintf (stderr, "fatal error: compress_buffer() returned zero when it shouldn't!\n");
+        return 0;
+    }
+
+    int least_bytes, best_hash_bits, best_history_bits, estimated_bytes, search_dir;
+    int max_hash_bits = num_codes == 1 ? 0 : 32 - __builtin_clz (num_codes - 1);
+
+    history_bits = MAX_HISTORY_BITS;
+    estimated_bytes = compress_buffer_size (buffer, num_samples, verbose, 1, &history_bits, histogram, flags & ~NUM_FLAGS);
+    best_history_bits = history_bits;
+    best_hash_bits = search_dir = 1;
+    least_bytes = estimated_bytes;
+
+    if (verbose) fprintf (verbose, "hash bits = %d, history_bits = %d, size = %d\n", 1, history_bits, estimated_bytes);
+
+    history_bits = MAX_HISTORY_BITS;
+    estimated_bytes = compress_buffer_size (buffer, num_samples, verbose, max_hash_bits, &history_bits, histogram, flags & ~NUM_FLAGS);
+
+    if (verbose) fprintf (verbose, "hash bits = %d, history_bits = %d, size = %d\n", max_hash_bits, history_bits, estimated_bytes);
+
+    if (estimated_bytes < least_bytes) {
+        least_bytes = estimated_bytes;
+        best_history_bits = history_bits;
+        best_hash_bits = max_hash_bits;
+        search_dir = -1;
+    }
+
+    for (hash_bits = best_hash_bits + search_dir; hash_bits < max_hash_bits && hash_bits > 1; hash_bits += search_dir) {
+        history_bits = MAX_HISTORY_BITS;
+        estimated_bytes = compress_buffer_size (buffer, num_samples, verbose, hash_bits, &history_bits, histogram, flags & ~NUM_FLAGS);
+
+        if (verbose) fprintf (verbose, "hash bits = %d, history_bits = %d, size = %d\n", hash_bits, history_bits, estimated_bytes);
+
+        if (estimated_bytes > least_bytes + (least_bytes / 10) + 1000)
+            break;
+
+        if (estimated_bytes < least_bytes) {
+            least_bytes = estimated_bytes;
+            best_history_bits = history_bits;
+            best_hash_bits = hash_bits;
+        }
+    }
+
+    if (bytes_written <= least_bytes) {
+        best_history_bits = best_hash_bits = 0;
+        least_bytes = bytes_written;
+    }
+
+    if (verbose) fprintf (verbose, "best: hash bits = %d, history_bits = %d, size = %d\n", best_hash_bits, best_history_bits, least_bytes);
+
+    if (rle_encode_bytes && rle_encode_bytes <= least_bytes) {
+        if (outbuffer) {
+            rle_encode (buffer, num_samples, outp);
+            outp [-1] = flags;
+        }
+
+        if (verbose) fprintf (verbose, "rle encoding used, %d bytes <= %d bytes\n", rle_encode_bytes, least_bytes);
+        return rle_encode_bytes + 1;
+    }
+
+    if (verbose && rle_encode_bytes)
+        fprintf (verbose, "rle encoding not used, %d bytes > %d bytes\n", rle_encode_bytes, least_bytes);
+
+    if (outbuffer) {
+        least_bytes = compress_buffer (buffer, num_samples, outp, outbytes, verbose, best_hash_bits, &best_history_bits, histogram, flags & ~NUM_FLAGS);
+        outp [-1] = flags & ~RLE_FLAGS;
+    }
+
+    return least_bytes + 1;
 }
 
-static void calculate_probabilities (int hist [256], unsigned char probs [256], unsigned short prob_sums [256], int num_codes)
+static void calculate_probabilities (int *hist, prob_t *probs, unsigned short *prob_sums, int num_codes)
 {
-    int sum_values = 0, max_hits = 0, i;
-    double scaler;
+    int code_hits = 0, min_value = 0, max_value = 0, sum_values = 0, i;
 
     for (i = 0; i < num_codes; ++i)
-        if (hist [i] > max_hits) max_hits = hist [i];
+        if (hist [i]) {
+            if (code_hits++) {
+                if (hist [i] < min_value) min_value = hist [i];
+                if (hist [i] > max_value) max_value = hist [i];
+                sum_values += hist [i];
+            }
+            else
+                sum_values = min_value = max_value = hist [i];
+        }
 
-    if (max_hits == 0) {    // this shouldn't happen!
-        memset (probs, 0, sizeof (*probs) * num_codes);
+    if (!code_hits) {        // this shouldn't happen!
+        memset (probs, 0, sizeof (prob_t) * num_codes);
         memset (prob_sums, 0, sizeof (*prob_sums) * num_codes);
         return;
     }
 
-    if (max_hits > MAX_PROBABILITY)
-        scaler = (double) MAX_PROBABILITY / max_hits;
+    if (min_value == max_value) {
+        for (sum_values = i = 0; i < num_codes; ++i)
+            prob_sums [i] = sum_values += probs [i] = !!hist [i];
+
+        return;
+    }
+
+    int target_min = 8 * min_value / max_value + 1;
+    double scaler = 1.0;
+
+    if (sum_values > MAX_PROBABILITY)
+        scaler = (double) MAX_PROBABILITY / sum_values;
+
+    if (min_value * scaler > target_min)
+        scaler = (double) target_min / min_value;
+
+    if (scaler == 1.0)
+        for (sum_values = i = 0; i < num_codes; ++i)
+            prob_sums [i] = sum_values += probs [i] = log2linear [linear2log [hist [i]]];
     else
-        scaler = 1.0;
-
-    for (i = 0; i < num_codes; ++i) {
-        int value;
-
-        if (hist [i]) {
-            value = floor (hist [i] * scaler + 0.5);
-
-            if (value > MAX_PROBABILITY)
-                value = MAX_PROBABILITY;
-            else if (!value)
-                value = 1;
-        }
-        else
-            value = 0;
-
-        prob_sums [i] = sum_values += value;
-        probs [i] = value;
-    }
-
-#if 0   // this code reduces probability values when they are completely redundant (i.e., common divisor), but
-        // this doesn't really happen often enough to make it worthwhile
-
-    if (min_value > 1) {
-        for (i = 0; i < num_codes; ++i)
-            if (probs [i] % min_value)
-                break;
-
-        if (i == num_codes) {
-            for (i = 0; i < num_codes; ++i) {
-                prob_sums [i] /= min_value;
-                probs [i] /= min_value;
+        for (sum_values = i = 0; i < num_codes; ++i) {
+            if (hist [i]) {
+                int prob = floor (hist [i] * scaler + 0.5);
+                if (!prob) prob = 1;
+                prob_sums [i] = sum_values += probs [i] = log2linear [linear2log [prob]];
             }
-
-            // fprintf (stderr, "fixed min_value = %d, divisor = %d, probs_sum = %d\n", min_value, divisor, prob_sums [num_codes-1]);
+            else
+                prob_sums [i] = sum_values += probs [i] = 0;
         }
-    }
-#endif
+
+    return;
 }
 
-static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, char history_bytes, unsigned char *code_map_ptr)
+static double calculate_probabilities_size (int *hist, prob_t *probs, int num_codes)
 {
-    int bc = num_samples, num_codes = 0, history_bins, bins_mask_size, used_bins, p0, p1, i;
-    unsigned int low = 0, high = 0xffffffff, mult;
-    unsigned char code_map [32], code_xlate [256];
-    unsigned char *bp = buffer, *bins_mask;
+    int code_hits = 0, min_value = 0, max_value = 0, sum_values = 0, total_hits, i;
+    double encoding_bits = 0.0;
+
+    for (i = 0; i < num_codes; ++i)
+        if (hist [i]) {
+            if (code_hits++) {
+                if (hist [i] < min_value) min_value = hist [i];
+                if (hist [i] > max_value) max_value = hist [i];
+                sum_values += hist [i];
+            }
+            else
+                sum_values = min_value = max_value = hist [i];
+        }
+
+    total_hits = sum_values;
+
+    if (!code_hits) {        // this shouldn't happen!
+        memset (probs, 0, sizeof (prob_t) * num_codes);
+        return encoding_bits;
+    }
+
+    if (min_value == max_value) {
+        for (i = 0; i < num_codes; ++i)
+            probs [i] = !!hist [i];
+
+        return log (code_hits / 1.0) / log (2) * total_hits;
+    }
+
+    int target_min = 8 * min_value / max_value + 1;
+    double scaler = 1.0;
+
+    if (sum_values > MAX_PROBABILITY)
+        scaler = (double) MAX_PROBABILITY / sum_values;
+
+    if (min_value * scaler > target_min)
+        scaler = (double) target_min / min_value;
+
+    if (scaler == 1.0)
+        for (sum_values = i = 0; i < num_codes; ++i)
+            sum_values += probs [i] = log2linear [linear2log [hist [i]]];
+    else
+        for (sum_values = i = 0; i < num_codes; ++i) {
+            if (hist [i]) {
+                int prob = floor (hist [i] * scaler + 0.5);
+                if (!prob) prob = 1;
+                sum_values += probs [i] = log2linear [linear2log [prob]];
+            }
+            else
+                sum_values += probs [i] = 0;
+        }
+
+    for (i = 0; i < num_codes; ++i)
+        if (hist [i])
+            encoding_bits += log ((double) sum_values / probs [i]) / log (2) * hist [i];
+
+    return encoding_bits;
+}
+
+static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuffer, int outbytes, FILE *verbose, int hash_bits, int *history_bits, int *src_histogram, int flags)
+{
+    int bc = num_samples, num_codes = 0, history_bins, history_mask, bins_mask_size, used_bins, p0, p1, i;
+    unsigned char hash_xlate [256], code_xlate [256], codes [256], *bp = buffer, *bins_mask;
+    unsigned int total_summed_probabilities = 0, low = 0, high = 0xffffffff, mult;
+    int max_history_bits = 0, max_used_bins = 1;
     unsigned short *summed_probabilities;
-    unsigned char *probabilities;
-    int total_summed_probabilities = 0;
-    int (*histogram) [256];
+    unsigned short *hist_xlate_16 = NULL;
+    unsigned int *hist_xlate_32 = NULL;
     char *outp = outbuffer;
+    prob_t *probabilities;
 
-    if (outbytes < 100)
-        return 0;
-
-    memcpy (code_map, code_map_ptr, sizeof (code_map));
-
-    for (num_codes = i = 0; i < sizeof (code_map); i++)
-        num_codes += __builtin_popcount (code_map [i]);
-
-    if (num_codes < 250) {
-        int incode, outcode;
-
-        for (incode = outcode = 0; incode < 256; ++incode)
-            if (code_map [incode >> 3] & (1 << (incode & 7)))
-                code_xlate [incode] = outcode++;
-    }
-    else {
-        num_codes = 256;
-        for (i = 0; i < 256; ++i)
-            code_xlate [i] = i;
+    if (flags & HISTORY_DEPTH_MASK) {
+        max_used_bins = 1 << ((flags & HISTORY_DEPTH_MASK) * 2 + 6);
+        max_history_bits = (flags & HISTORY_DEPTH_MASK) * 3 + 9;
     }
 
-    for (history_bins = 1, i = history_bytes; i; i--)
-        if ((history_bins *= num_codes) > MAX_HISTORY_BINS)
+    if (*history_bits > max_history_bits)
+        *history_bits = max_history_bits;
+
+    memcpy (outp, &num_samples, sizeof (num_samples));
+    outp += sizeof (num_samples);
+    outbytes -= sizeof (num_samples);
+
+    unsigned char hash_bits_byte = hash_bits, history_bits_byte = *history_bits;
+
+    memcpy (outp, &hash_bits_byte, sizeof (hash_bits_byte));
+    outp += sizeof (hash_bits_byte);
+    outbytes -= sizeof (hash_bits_byte);
+
+    memcpy (outp, &history_bits_byte, sizeof (history_bits_byte));
+    outp += sizeof (history_bits_byte);
+    outbytes -= sizeof (history_bits_byte);
+
+    history_mask = (history_bins = 1 << *history_bits) - 1;
+
+    if (*history_bits) {
+        memset (code_xlate, -1, sizeof (code_xlate));
+
+        while (num_codes < 256) {
+            int max_hits = 0, next_code = 0;
+
+            for (i = 0; i < 256; ++i)
+                if (src_histogram [i] > max_hits && code_xlate [i] == 0xff) {
+                    max_hits = src_histogram [i];
+                    next_code = i;
+                }
+
+            if (max_hits) {
+                code_xlate [next_code] = num_codes;
+                codes [num_codes++] = next_code;
+            }
+            else
+                break;
+        }
+
+        if (outbytes + num_codes < 100)
             return 0;
 
-    bins_mask_size = (history_bins + 7) / 8;
-    bins_mask = calloc (1, bins_mask_size);
-    histogram = calloc (1, sizeof (*histogram) * history_bins);
-    p0 = p1 = 0;
+        for (i = 0; i < 256; ++i)
+            hash_xlate [i] = hashed_code (i, 1 << hash_bits);
 
-    int history_mod = history_bins / num_codes;
+        bins_mask_size = (history_bins + 7) / 8;
+        bins_mask = calloc (1, bins_mask_size);
+        p0 = p1 = 0;
 
-    while (bc--) {
-        bins_mask [p0 >> 3] |= 1 << (p0 & 7);
-        histogram [p0] [code_xlate [*bp]]++;
-
-        if (num_codes != 256) {
-            if (history_bytes == 0)
-                p0 = *bp++ * 0;
-            else if (history_bytes == 1)
-                p0 = code_xlate [*bp++];
-            else
-                p0 = (p0 % history_mod) * num_codes + code_xlate [*bp++];
+        while (bc--) {
+            bins_mask [p0 >> 3] |= 1 << (p0 & 7);
+            p0 = ((p0 << hash_bits) | hash_xlate [code_xlate [*bp++]]) & history_mask;
         }
+
+        bins_mask [p0 >> 3] |= 1 << (p0 & 7);   // make sure final code is in bins_mask even though no ptable entry required
+
+        for (used_bins = i = 0; i < bins_mask_size; ++i)
+            used_bins += __builtin_popcount (bins_mask [i]);
+
+        if (used_bins > max_used_bins) {
+            fprintf (stderr, "compress_buffer(): maximum used bin exceeded, %d\n", used_bins);
+            return 0;
+        }
+
+        if (used_bins > 65536)
+            hist_xlate_32 = malloc (sizeof (*hist_xlate_32) * history_bins);
         else
-            p0 = ((p0 << 8) | code_xlate [*bp++]) & (history_bins - 1);
-    }
+            hist_xlate_16 = malloc (sizeof (*hist_xlate_16) * history_bins);
 
-    for (used_bins = i = 0; i < bins_mask_size; ++i)
-        used_bins += __builtin_popcount (bins_mask [i]);
+        int hist_index;
 
-    if (used_bins > MAX_USED_BINS) {
-        free (bins_mask);
-        free (histogram);
-        return 0;
-    }
-
-    probabilities = malloc (sizeof (*probabilities) * used_bins * num_codes);
-    summed_probabilities = malloc (sizeof (*summed_probabilities) * used_bins * num_codes);
-    int *hist_xlate = malloc (sizeof (int) * history_bins), hist_index;
-
-    for (hist_index = p0 = 0; p0 < history_bins; p0++)
-        if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
-            calculate_probabilities (histogram [p0], probabilities + hist_index * num_codes, summed_probabilities + hist_index * num_codes, num_codes);
-            total_summed_probabilities += summed_probabilities [hist_index * num_codes + num_codes - 1];
-            hist_xlate [p0] = hist_index++;
-        }
-
-    free (histogram);
-
-    // This code detects the case where the required value lookup tables grow silly big and cuts them back down. This would
-    // normally only happen with large blocks or poorly compressible data. The target is to guarantee that the total memory
-    // required for all three decode tables will be 2K bytes per history bin.
-
-    while (total_summed_probabilities > used_bins * MAX_BYTES_PER_BIN) {
-        int max_sum = 0, sum_values = 0, largest_bin = 0;
-
-        for (p0 = 0; p0 < used_bins; ++p0)
-            if (summed_probabilities [p0 * num_codes + num_codes - 1] > max_sum) {
-                max_sum = summed_probabilities [p0 * num_codes + num_codes - 1];
-                largest_bin = p0;
+        for (hist_index = p0 = 0; p0 < history_bins; p0++)
+            if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
+                if (hist_xlate_32)
+                    hist_xlate_32 [p0] = hist_index++;
+                else
+                    hist_xlate_16 [p0] = hist_index++;
             }
 
-        total_summed_probabilities -= max_sum;
-        p0 = largest_bin;
+        int *histogram = calloc (1, num_codes * used_bins * sizeof (*histogram));
 
-        for (p1 = 0; p1 < num_codes; ++p1)
-            summed_probabilities [p0 * num_codes + p1] = sum_values += probabilities [p0 * num_codes + p1] = (probabilities [p0 * num_codes + p1] + 1) >> 1;
+        bp = buffer;
+        bc = num_samples;
+        p0 = p1 = 0;
 
-        total_summed_probabilities += summed_probabilities [p0 * num_codes + num_codes - 1];
-    }
+        while (bc--) {
+            histogram [(hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0]) * num_codes + code_xlate [*bp]]++;
+            p0 = ((p0 << hash_bits) | hash_xlate [code_xlate [*bp++]]) & history_mask;
+        }
 
-    memcpy (outp, &num_samples, sizeof (num_samples)); outp += sizeof (num_samples); outbytes -= sizeof (num_samples);
-    memcpy (outp, &history_bytes, sizeof (history_bytes)); outp += sizeof (history_bytes); outbytes -= sizeof (history_bytes);
+        probabilities = malloc (sizeof (prob_t) * used_bins * num_codes);
+        summed_probabilities = malloc (sizeof (*summed_probabilities) * used_bins * num_codes);
 
-    unsigned char num_codes_byte = num_codes, max_probability = MAX_PROBABILITY;
-    memcpy (outp, &num_codes_byte, sizeof (num_codes_byte)); outp += sizeof (num_codes_byte); outbytes -= sizeof (num_codes_byte);
+        for (p0 = 0; p0 < used_bins; p0++) {
+            calculate_probabilities (histogram + p0 * num_codes, probabilities + p0 * num_codes, summed_probabilities + p0 * num_codes, num_codes);
+            total_summed_probabilities += summed_probabilities [p0 * num_codes + num_codes - 1];
+        }
 
-    if (num_codes != 256) {
-        memcpy (outp, code_map, sizeof (code_map)); outp += sizeof (code_map); outbytes -= sizeof (code_map);
-    }
+        free (histogram);
 
-    memcpy (outp, &max_probability, sizeof (max_probability)); outp += sizeof (max_probability); outbytes -= sizeof (max_probability);
+        unsigned char num_codes_byte = num_codes;
 
-    int encoded_bins_mask_size = rle_encode_bits (bins_mask, bins_mask_size, NULL);
+        memcpy (outp, &num_codes_byte, sizeof (num_codes_byte));
+        outp += sizeof (num_codes_byte);
+        outbytes -= sizeof (num_codes_byte);
 
-#ifdef CAPTURE_BINS_MASK
-    if (0) {
-#else
-    if (encoded_bins_mask_size < bins_mask_size) {
-#endif
-        if (outbytes < encoded_bins_mask_size + 100) {
-            free (bins_mask); free (probabilities); free (summed_probabilities); free (hist_xlate);
+        memcpy (outp, codes, num_codes);
+        outp += num_codes;
+        outbytes -= num_codes;
+
+        if (verbose) fprintf (verbose, "%d codes: %02x most common, %02x least common\n", num_codes, codes [0], codes [num_codes - 1]);
+
+        int compressed_bit_mask_size = compress_buffer_best (bins_mask, bins_mask_size, outp, outbytes, NULL,
+            (flags & HISTORY_DEPTH_MASK) > 1 ? TRY_RLE_FLAG | 1 : TRY_RLE_FLAG);
+
+        if (!compressed_bit_mask_size) {
+            free (bins_mask); free (summed_probabilities); free (probabilities);
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
             return 0;
         }
 
-        *outp++ = 1; outbytes--;
-        outp += rle_encode_bits (bins_mask, bins_mask_size, outp); outbytes -= encoded_bins_mask_size;
+        outbytes -= compressed_bit_mask_size;
+        outp += compressed_bit_mask_size;
 
-        if (verbose) fprintf (verbose, "%d history bytes, %d of %d bins used, bin mask size = %d, compressed = %d\n",
-            history_bytes, used_bins, history_bins, bins_mask_size, encoded_bins_mask_size);
+        if (verbose) fprintf (verbose, "%d hash bits, %d of %d bins used, bin mask size = %d, compressed = %d\n",
+            hash_bits, used_bins, history_bins, bins_mask_size, compressed_bit_mask_size);
+
+        int ptable_encode_size = used_bins * num_codes * sizeof (unsigned char);
+        unsigned char *pared_ptable = malloc (ptable_encode_size), *dst = pared_ptable;
+        prob_t *src = probabilities;
+        int next_code;
+
+        for (p0 = 0; p0 < history_bins; p0++)
+            if (bins_mask [p0 >> 3] & (1 << (p0 & 7)))
+                for (next_code = 0; next_code < num_codes; ++next_code) {
+                    p1 = ((p0 << hash_bits) | hash_xlate [next_code]) & history_mask;
+                    if (bins_mask [p1 >> 3] & (1 << (p1 & 7)))
+                        *dst++ = linear2log [*src++];
+                    else
+                        src++;
+                }
+
+        ptable_encode_size = (int)((dst - pared_ptable) * sizeof (unsigned char));
+        free (bins_mask);
+
+        int compressed_ptable_size = compress_buffer_best (pared_ptable, ptable_encode_size, outp, outbytes,
+            NULL, (flags & HISTORY_DEPTH_MASK) > 1 ? TRY_RLE_FLAG | 1 : TRY_RLE_FLAG);
+
+        if (!compressed_ptable_size) {
+            free (pared_ptable); free (summed_probabilities); free (probabilities);
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+            return 0;
+        }
+
+        outbytes -= compressed_ptable_size;
+        outp += compressed_ptable_size;
+
+        if (verbose) fprintf (verbose, "%d of 256 codes used, probability tables size = %d, compressed = %d\n",
+            num_codes, ptable_encode_size, compressed_ptable_size);
+
+        free (pared_ptable);
     }
     else {
-        if (outbytes < bins_mask_size + 100) {
-            free (bins_mask); free (probabilities); free (summed_probabilities); free (hist_xlate);
+        unsigned char log_ptable [256];
+        num_codes = 256;
+
+        for (i = 0; i < 256; ++i)
+            hash_xlate [i] = code_xlate [i] = i;
+
+        probabilities = malloc (sizeof (prob_t) * 256);
+        summed_probabilities = malloc (sizeof (*summed_probabilities) * 256);
+        calculate_probabilities (src_histogram, probabilities, summed_probabilities, 256);
+
+        for (i = 0; i < 256; ++i)
+            log_ptable [i] = linear2log [probabilities [i]];
+
+        int compressed_ptable_size = compress_buffer_best (log_ptable, sizeof (log_ptable), outp, outbytes, NULL, FORCE_RLE_FLAG);
+
+        if (!compressed_ptable_size) {
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+            free (summed_probabilities); free (probabilities);
             return 0;
         }
 
-        *outp++ = 0; outbytes--;
-        memcpy (outp, bins_mask, bins_mask_size); outp += bins_mask_size; outbytes -= bins_mask_size;
-
-        if (verbose) fprintf (verbose, "%d history bytes, %d of %d bins used, bin mask size = %d\n",
-            history_bytes, used_bins, history_bins, bins_mask_size);
-
-#ifdef CAPTURE_BINS_MASK
-        FILE *capture = fopen ("capture.bin", "wb");
-
-        if (capture) {
-            fwrite (bins_mask, 1, bins_mask_size, capture);
-            fclose (capture);
-        }
-#endif
+        outbytes -= compressed_ptable_size;
+        outp += compressed_ptable_size;
     }
-
-    free (bins_mask);
-
-#if (MAX_PROBABILITY < 0xFF) && !defined (CAPTURE_PROB_TABLES)
-    int encoded_prob_size = rle_encode_bytes (probabilities, used_bins * num_codes, NULL);
-
-    if (outbytes < encoded_prob_size + 100) {
-        free (probabilities); free (summed_probabilities); free (hist_xlate);
-        return 0;
-    }
-
-    rle_encode_bytes (probabilities, used_bins * num_codes, outp); outp += encoded_prob_size; outbytes -= encoded_prob_size;
-    if (verbose) fprintf (verbose, "%d of 256 codes used, probability tables size = %d, compressed = %d\n",
-        num_codes, used_bins * num_codes, encoded_prob_size);
-#else
-    if (outbytes < used_bins * num_codes + 100) {
-        free (probabilities); free (summed_probabilities); free (hist_xlate);
-        return 0;
-    }
-
-    memcpy (outp, probabilities, used_bins * num_codes); outp += used_bins * num_codes; outbytes -= used_bins * num_codes;
-    if (verbose) fprintf (verbose, "%d of 256 codes used, probability tables size = %d, not compressed\n",
-        num_codes, used_bins * num_codes);
-
-#ifdef CAPTURE_PROB_TABLES
-        FILE *capture = fopen ("capture.bin", "wb");
-
-        if (capture) {
-            fwrite (probabilities, 1, used_bins * num_codes, capture);
-            fclose (capture);
-        }
-#endif
-
-#endif
 
     char *encoding_start = outp;
 
@@ -463,7 +706,7 @@ static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuf
     p0 = p1 = 0;
 
     while (bc--) {
-        int bin = hist_xlate [p0], bindex = bin * num_codes;
+        int bindex = history_mask ? (hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0]) * num_codes : 0;
         int code = code_xlate [*bp++];
 
         mult = (high - low) / summed_probabilities [bindex + num_codes - 1];
@@ -472,7 +715,8 @@ static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuf
             high = low;
 
             while ((high >> 24) == (low >> 24)) {
-                *outp++ = high >> 24; outbytes--;
+                *outp++ = high >> 24;
+                outbytes--;
                 high = (high << 8) | 0xff;
                 low <<= 8;
             }
@@ -486,24 +730,18 @@ static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuf
         high = low + probabilities [bindex + code] * mult - 1;
 
         while ((high >> 24) == (low >> 24)) {
-            *outp++ = high >> 24; outbytes--;
+            *outp++ = high >> 24;
+            outbytes--;
             high = (high << 8) | 0xff;
             low <<= 8;
         }
 
-        if (num_codes != 256) {
-            if (history_bytes == 0)
-                p0 = 0;
-            else if (history_bytes == 1)
-                p0 = code;
-            else
-                p0 = (p0 % history_mod) * num_codes + code;
-        }
-        else
-            p0 = ((p0 << 8) | code) & (history_bins - 1);
+        if (history_mask)
+            p0 = ((p0 << hash_bits) | hash_xlate [code]) & history_mask;
 
         if (outbytes < 100) {
-            free (hist_xlate); free (summed_probabilities); free (probabilities);
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+            free (summed_probabilities); free (probabilities);
             return 0;
         }
     }
@@ -511,366 +749,876 @@ static int compress_buffer (unsigned char *buffer, int num_samples, char *outbuf
     high = low;
 
     while ((high >> 24) == (low >> 24)) {
-        *outp++ = high >> 24; outbytes--;
+        *outp++ = high >> 24;
+        outbytes--;
         high = (high << 8) | 0xff;
         low <<= 8;
     }
 
-    if (verbose) fprintf (verbose, "encoded data bytes = %d, total bytes written = %d\n",
-        (int) (outp - encoding_start), (int) (outp - outbuffer));
+    if (verbose) fprintf (verbose, "encoded data bytes = %d, total bytes written = %d (%.2f%%)\n",
+        (int) (outp - encoding_start), (int) (outp - outbuffer), (outp - outbuffer) * 100.0 / num_samples);
 
-    free (hist_xlate);
+    free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
     free (summed_probabilities);
     free (probabilities);
     return outp - outbuffer;
 }
 
-/*------------------------------------------------------------------------------------------------------------------------*/
-
-#define BUFFER_SIZE (1024*1024)
-
-int newpack_decompress (FILE *infile, FILE *outfile, FILE *verbose, int use_model_only)
+static int compress_buffer_size (unsigned char *buffer, int num_samples, FILE *verbose, int hash_bits, int *history_bits, int *src_histogram, int flags)
 {
-    unsigned char *input_buffer = malloc (BUFFER_SIZE), *inp = input_buffer, *inpx = input_buffer;
-    unsigned char *probabilities, **value_lookup, *lookup_buffer, history_bytes, max_probability;
-    long long total_bytes_read = 12, total_bytes_written = 0;
-    unsigned char code_map [32], code_xlate [256], *vp;
-    int num_samples, history_bins, num_codes;
-    unsigned short *summed_probabilities;
+    int bc = num_samples, num_codes = 0, smallest_size = 0, history_bins, history_mask, bins_mask_size, used_bins, p0, p1, i;
+    unsigned char hash_xlate [256], code_xlate [256], /* codes [256], */ *bp = buffer, *bins_mask;
+    int max_history_bits = 0, max_used_bins = 1;
+    unsigned short *hist_xlate_16 = NULL;
+    unsigned int *hist_xlate_32 = NULL;
 
-    while (1) {
-        unsigned int low = 0, high = 0xffffffff, mult, value, sum_values;
-        char *output_buffer, *outp;
-        int p0, p1, i;
+    if (flags & HISTORY_DEPTH_MASK) {
+        max_used_bins = 1 << ((flags & HISTORY_DEPTH_MASK) * 2 + 6);
+        max_history_bits = (flags & HISTORY_DEPTH_MASK) * 3 + 9;
+    }
 
-        for (i = 0; i < 4; ++i) {
-            if (inp == inpx) {
-                total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
+    if (*history_bits > max_history_bits)
+        *history_bits = max_history_bits;
 
-                if (inp == inpx)
-                    break;
+    if (!*history_bits) {
+        int outbytes = sizeof (num_samples) + 2, encoding_bytes, ptable_bytes;
+        unsigned char log_ptable [256];
+        prob_t probabilities [256];
+
+        encoding_bytes = ceil ((32.0 + calculate_probabilities_size (src_histogram, probabilities, 256)) / 8.0);
+
+        for (i = 0; i < 256; ++i)
+            log_ptable [i] = linear2log [probabilities [i]];
+
+        ptable_bytes = compress_buffer_best (log_ptable, sizeof (log_ptable), NULL, sizeof (log_ptable) * 2, NULL, FORCE_RLE_FLAG);
+
+        return outbytes + ptable_bytes + encoding_bytes;
+    }
+
+    memset (code_xlate, -1, sizeof (code_xlate));
+
+    while (num_codes < 256) {
+        int max_hits = 0, next_code = 0;
+
+        for (i = 0; i < 256; ++i)
+            if (src_histogram [i] > max_hits && code_xlate [i] == 0xff) {
+                max_hits = src_histogram [i];
+                next_code = i;
             }
 
-            ((char *) &num_samples) [i] = *inp++;
-        }
-
-        if (i != 4)
-            break;
-
-        if (inp == inpx) {
-            total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-            if (inp == inpx)
-                break;
-        }
-
-        history_bytes = *inp++;
-
-        if (history_bytes == NO_COMPRESSION) {
-            outp = output_buffer = malloc (num_samples);
-
-            while (num_samples--) {
-                if (inp == inpx) {
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                    if (inp == inpx)
-                        break;
-                }
-
-                *outp++ = *inp++;
-            }
-
-            total_bytes_written += fwrite (output_buffer, 1, outp - output_buffer, outfile);
-            free (output_buffer);
-            continue;
-        }
-
-        if (inp == inpx) {
-            total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-            if (inp == inpx)
-                break;
-        }
-
-        unsigned char num_codes_byte;
-        num_codes_byte = *inp++;
-        num_codes = num_codes_byte ? num_codes_byte : 256;
-
-        if (num_codes != 256) {
-            int incode, outcode;
-
-            for (i = 0; i < sizeof (code_map); ++i) {
-                if (inp == inpx) {
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                    if (inp == inpx)
-                        break;
-                }
-
-                code_map [i] = *inp++;
-            }
-
-            if (i != sizeof (code_map))
-                break;
-
-            for (incode = outcode = 0; incode < 256; ++incode)
-                if (code_map [incode >> 3] & (1 << (incode & 7)))
-                    code_xlate [outcode++] = incode;
-        }
+        if (max_hits)
+            code_xlate [next_code] = num_codes++;
         else
-            for (i = 0; i < 256; ++i)
-                code_xlate [i] = i;
-
-        for (history_bins = 1, i = history_bytes; i; i--)
-            if ((history_bins *= num_codes) > MAX_HISTORY_BINS) {
-                fprintf (stderr, "fatal decoding error, history bins = %d\n", history_bins);
-                return 1;
-            }
-
-        if (inp == inpx) {
-            total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-            if (inp == inpx)
-                break;
-        }
-
-        max_probability = *inp++;
-
-        int bin_mask_size = (history_bins + 7) / 8, used_bins = 0, bit_index;
-        unsigned char *bins_mask = malloc (bin_mask_size), *ptr, byte;
-
-        if (inp == inpx) {
-            total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-            if (inp == inpx)
-                break;
-        }
-
-        byte = *inp++;
-
-        if (byte) {
-            memset (bins_mask, 0, bin_mask_size);
-            bit_index = -1;
-
-            while (1) {
-                if (inp == inpx) {
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                    if (inp == inpx)
-                        break;
-                }
-
-                byte = *inp++;
-
-                if (!byte)
-                    break;
-
-                if (byte < 0xFF) {
-                    bit_index += byte;
-
-                    if (bit_index >= bin_mask_size << 3)
-                        break;
-
-                    bins_mask [bit_index >> 3] |= 1 << (bit_index & 7);
-                }
-                else
-                    bit_index += 0xFE;
-            }
-        }
-        else {
-            for (i = 0; i < bin_mask_size; ++i) {
-
-                if (inp == inpx) {
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                    if (inp == inpx)
-                        break;
-                }
-
-                bins_mask [i] = *inp++;
-            }
-
-            if (i != bin_mask_size)
-                break;
-        }
-
-        for (i = 0; i < bin_mask_size; ++i)
-            used_bins += __builtin_popcount (bins_mask [i]);
-
-        if (used_bins > MAX_USED_BINS) {
-            fprintf (stderr, "fatal decoding error, used bins = %d\n", used_bins);
-            return 1;
-        }
-
-        lookup_buffer = malloc (used_bins * MAX_BYTES_PER_BIN);
-        value_lookup = malloc (sizeof (*value_lookup) * used_bins);
-        summed_probabilities = malloc (sizeof (*summed_probabilities) * used_bins * num_codes);
-        ptr = probabilities = malloc (sizeof (*probabilities) * used_bins * num_codes);
-
-        if (max_probability < 0xff) {
-            while (1) {
-                if (inp == inpx)
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                if (*inp > max_probability) {
-                    int zcount = *inp++ - max_probability;
-
-                    while (zcount--)
-                        *ptr++ = 0;
-                }
-                else if (*inp)
-                    *ptr++ = *inp++;
-                else {
-                    inp++;
-                    break;
-                }
-            }
-
-            if (ptr != probabilities + used_bins * num_codes) {
-                fprintf (stderr, "fatal decoding error, read %d bytes, expected %d\n", (int)(ptr - probabilities), used_bins * num_codes);
-                return 1;
-            }
-        }
-        else {
-            for (i = 0; i < used_bins * num_codes; ++i) {
-                if (inp == inpx)
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                *ptr++ = *inp++;
-            }
-        }
-
-        outp = output_buffer = malloc (num_samples);
-        int *hist_xlate = malloc (sizeof (int) * history_bins), hist_index = 0;
-        memset (hist_xlate, -1, sizeof (int) * history_bins);
-        unsigned char *lb_ptr = lookup_buffer;
-        int total_summed_probabilities = 0;
-
-        for (p0 = 0; p0 < history_bins; ++p0)
-            if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
-                for (sum_values = i = 0; i < num_codes; ++i)
-                    summed_probabilities [hist_index * num_codes + i] = sum_values += probabilities [hist_index * num_codes + i];
-
-                if ((total_summed_probabilities += sum_values) > used_bins * MAX_BYTES_PER_BIN) {
-                    fprintf (stderr, "summed probabilities exceeded limit!\n");
-                    return 1;
-                }
-
-                value_lookup [hist_index] = lb_ptr;
-
-                for (i = 0; i < num_codes; i++) {
-                    int c = probabilities [hist_index * num_codes + i];
-
-                    while (c--)
-                        *lb_ptr++ = i;
-                }
-
-                hist_xlate [p0] = hist_index++;
-            }
-
-        for (i = 4; i--;) {
-            if (inp == inpx)
-                total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-            value = (value << 8) | *inp++;
-        }
-
-        free (bins_mask);
-        int history_mod = history_bins / num_codes;
-        p0 = p1 = 0;
-
-        while (num_samples--) {
-            int bin = hist_xlate [p0], bindex = bin * num_codes;
-
-            if (use_model_only) {
-                static unsigned long long kernel = 0x3141592653589793;
-
-                if (bin == -1)
-                    bin = hist_xlate [p0 = 0];
-
-                kernel = ((kernel << 4) - kernel) ^ 1;
-                kernel = ((kernel << 4) - kernel) ^ 1;
-                kernel = ((kernel << 4) - kernel) ^ 1;
-                i = value_lookup [bin] [(unsigned int)(kernel >> 32) % summed_probabilities [bindex + num_codes - 1]];
-            }
-            else {
-                if (bin == -1) {
-                    fprintf (stderr, "attempt to access unused history bin %d!\n", p0);
-                    return 1;
-                }
-
-                mult = (high - low) / summed_probabilities [bindex + num_codes - 1];
-
-                if (!mult) {
-                    for (i = 4; i--;) {
-                        if (inp == inpx)
-                            total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                        value = (value << 8) | *inp++;
-                    }
-
-                    low = 0;
-                    high = 0xffffffff;
-                    mult = high / summed_probabilities [bindex + num_codes - 1];
-
-                    if (!mult) {
-                        fprintf (stderr, "fatal decoding error, mult = 0!\n");
-                        return 1;
-                    }
-                }
-
-                i = (value - low) / mult;
-
-                if (i >= summed_probabilities [bindex + num_codes - 1]) {
-                    fprintf (stderr, "fatal decoding error, index too big!\n");
-                    return 1;
-                }
-
-                if ((i = value_lookup [bin] [i]))
-                    low += summed_probabilities [bindex + i - 1] * mult;
-
-                high = low + probabilities [bindex + i] * mult - 1;
-            }
-
-            *outp++ = code_xlate [i];
-
-            if (num_codes != 256) {
-                if (history_bytes == 0)
-                    p0 = 0;
-                else if (history_bytes == 1)
-                    p0 = i;
-                else
-                    p0 = (p0 % history_mod) * num_codes + i;
-            }
-            else
-                p0 = ((p0 << 8) | i) & (history_bins - 1);
-
-            while ((high >> 24) == (low >> 24)) {
-                if (inp == inpx)
-                    total_bytes_read += (inpx = input_buffer + fread (inp = input_buffer, 1, BUFFER_SIZE, infile)) - inp;
-
-                value = (value << 8) | *inp++;
-                high = (high << 8) | 0xff;
-                low <<= 8;
-            }
-        }
-
-        total_bytes_written += fwrite (output_buffer, 1, outp - output_buffer, outfile);
-        free (summed_probabilities);
-        free (probabilities);
-        free (lookup_buffer);
-        free (value_lookup);
-        free (output_buffer);
-        free (hist_xlate);
-
-        if (use_model_only)
             break;
     }
 
-    free (input_buffer);
+    for (i = 0; i < 256; ++i)
+        hash_xlate [i] = hashed_code (i, 1 << hash_bits);
 
-    if (verbose) fprintf (verbose, "decompression complete: %lld bytes --> %lld bytes (%.2f%%)\n",
-        total_bytes_read, total_bytes_written, total_bytes_read * 100.0 / total_bytes_written);
+    history_mask = (history_bins = 1 << *history_bits) - 1;
+    bins_mask_size = (history_bins + 7) / 8;
+    bins_mask = calloc (1, bins_mask_size);
+
+    while (1) {
+        bp = buffer;
+        bc = num_samples;
+        used_bins = p0 = p1 = 0;
+
+        while (bc--) {
+            if (!(bins_mask [p0 >> 3] & 1 << (p0 & 7))) {
+                bins_mask [p0 >> 3] |= 1 << (p0 & 7);
+
+                if (++used_bins > max_used_bins)
+                    break;
+            }
+
+            p0 = ((p0 << hash_bits) | hash_xlate [code_xlate [*bp++]]) & history_mask;
+        }
+
+        if (used_bins <= max_used_bins)
+            break;
+
+        history_mask = (history_bins /= 2) - 1;
+        bins_mask_size = (history_bins + 7) / 8;
+        memset (bins_mask, 0, bins_mask_size);
+        --*history_bits;
+    }
+
+    if (used_bins > 65536)
+        hist_xlate_32 = malloc (sizeof (*hist_xlate_32) * history_bins);
+    else
+        hist_xlate_16 = malloc (sizeof (*hist_xlate_16) * history_bins);
+
+    int hist_index;
+
+    for (hist_index = p0 = 0; p0 < history_bins; p0++)
+        if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
+            if (hist_xlate_32)
+                hist_xlate_32 [p0] = hist_index++;
+            else
+                hist_xlate_16 [p0] = hist_index++;
+        }
+
+    int *histogram = calloc (1, num_codes * used_bins * sizeof (*histogram));
+
+    bp = buffer;
+    bc = num_samples;
+    p0 = p1 = 0;
+
+    while (bc--) {
+        histogram [(hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0]) * num_codes + code_xlate [*bp]]++;
+        p0 = ((p0 << hash_bits) | hash_xlate [code_xlate [*bp++]]) & history_mask;
+    }
+
+    int initial_history_bits = *history_bits;
+    int sizes_by_history_bits [32] = { 0 };
+
+    while (1) {
+        prob_t *probabilities = malloc (sizeof (prob_t) * used_bins * num_codes);
+        int outbytes = 0;
+
+        double encoding_bits = 32.0;
+
+        for (p1 = p0 = 0; p0 < history_bins; p0++)
+            if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
+                int bin = hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0];
+                encoding_bits += calculate_probabilities_size (histogram + bin * num_codes, probabilities + p1 * num_codes, num_codes);
+                p1++;
+            }
+
+        outbytes += sizeof (num_samples) + 2;   // num_samples + hash_bits + history_bits;
+        outbytes += 1 + num_codes;              // num_codes + that many codes
+
+        int compressed_bit_mask_size = compress_buffer_best (bins_mask, bins_mask_size, NULL, bins_mask_size * 2 + 1024, NULL,
+            TRY_RLE_FLAG | ((flags & EXHAUSTIVE_FLAG) && (flags & HISTORY_DEPTH_MASK) > 1));
+
+        if (!compressed_bit_mask_size) {
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+            free (bins_mask); free (probabilities);
+            return 0;
+        }
+
+        outbytes += compressed_bit_mask_size;
+
+        int ptable_encode_size = used_bins * num_codes * sizeof (unsigned char);
+        unsigned char *pared_ptable = malloc (ptable_encode_size), *dst = pared_ptable;
+        prob_t *src = probabilities;
+        int next_code;
+
+        for (p0 = 0; p0 < history_bins; p0++)
+            if (bins_mask [p0 >> 3] & (1 << (p0 & 7)))
+                for (next_code = 0; next_code < num_codes; ++next_code) {
+                    p1 = ((p0 << hash_bits) | hash_xlate [next_code]) & history_mask;
+                    if (bins_mask [p1 >> 3] & (1 << (p1 & 7)))
+                        *dst++ = linear2log [*src++];
+                    else
+                        src++;
+                }
+
+        ptable_encode_size = (int)((dst - pared_ptable) * sizeof (unsigned char));
+
+        int compressed_ptable_size = compress_buffer_best (pared_ptable, ptable_encode_size, NULL, ptable_encode_size * 2 + 1024, NULL,
+            TRY_RLE_FLAG | ((flags & EXHAUSTIVE_FLAG) && (flags & HISTORY_DEPTH_MASK) > 1));
+
+        if (!compressed_ptable_size) {
+            free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+            free (pared_ptable); free (probabilities);
+            return 0;
+        }
+
+        outbytes += compressed_ptable_size;
+        free (probabilities);
+        free (pared_ptable);
+
+        outbytes += (int) ceil (encoding_bits / 8.0);
+        sizes_by_history_bits [*history_bits] = outbytes;
+
+        if (*history_bits <= 1 || *history_bits <= hash_bits)
+            break;
+
+        if (!smallest_size || outbytes < smallest_size)
+            smallest_size = outbytes;
+
+        for (p0 = 0, p1 = history_bins / 2; p0 < history_bins / 2; p0++, p1++) {
+            int lower = bins_mask [p0 >> 3] & (1 << (p0 & 7));
+            int upper = bins_mask [p1 >> 3] & (1 << (p1 & 7));
+
+            if (lower || upper) {
+                if (lower && upper) {
+                    int *lower_hist = histogram + (hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0]) * num_codes;
+                    int *upper_hist = histogram + (hist_xlate_32 ? hist_xlate_32 [p1] : hist_xlate_16 [p1]) * num_codes;
+                    int entries = num_codes;
+
+                    while (entries--)
+                        *lower_hist++ += *upper_hist++;
+
+                    used_bins--;
+                }
+                else if (upper) {
+                    bins_mask [p0 >> 3] |= 1 << (p0 & 7);
+                    if (hist_xlate_32)
+                        hist_xlate_32 [p0] = hist_xlate_32 [p1];
+                    else
+                        hist_xlate_16 [p0] = hist_xlate_16 [p1];
+                }
+            }
+        }
+
+        --*history_bits;
+        history_mask = (history_bins /= 2) - 1;
+        bins_mask_size = (history_bins + 7) / 8;
+    }
+
+    free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+    free (histogram);
+    free (bins_mask);
+
+    for (i = initial_history_bits; i; i--)
+        if (sizes_by_history_bits [i] &&
+            sizes_by_history_bits [i] < sizes_by_history_bits [*history_bits])
+                *history_bits = i;
+
+    return sizes_by_history_bits [*history_bits];
+}
+
+/* ----------------------------- decompression --------------------------------*/
+
+int newpack_decompress (FILE *infile, FILE *outfile, FILE *verbose, int use_model_only)
+{
+    int total_bytes_read = 0, total_bytes_written = 0;
+
+    generate_log_tables ();
+
+    while (1) {
+        int output_size, input_size, bytes_read;
+        char preamble [10];
+
+        bytes_read = fread (preamble, 1, sizeof (preamble), infile);
+
+        if (!bytes_read)
+            break;
+
+        if (bytes_read != sizeof (preamble) || strncmp (preamble, "newpack0.2", sizeof (preamble)) ||
+            fread (&output_size, 1, sizeof (output_size), infile) != sizeof (output_size) ||
+            fread (&input_size, 1, sizeof (input_size), infile) != sizeof (input_size)) {
+                fprintf (stderr, "not a valid newpack 0.2 file!\n");
+                return 1;
+        }
+
+        total_bytes_read += sizeof (preamble) + sizeof (input_size) + sizeof (output_size);
+        unsigned char *enc_buffer = malloc (input_size), *enc_ptr = enc_buffer;
+        unsigned char *dec_buffer = malloc (output_size);
+
+        if (fread (enc_buffer, 1, input_size, infile) != input_size) {
+            fprintf (stderr, "can't read %d byte-block from file!\n", input_size);
+            return 1;
+        }
+
+        total_bytes_read += input_size;
+
+        int decoded_bytes = decompress_interleave (&enc_ptr, &input_size, dec_buffer, output_size, use_model_only);
+
+        if (decoded_bytes != output_size) {
+            fprintf (stderr, "decode error, expected %d decoded bytes, got %d\n", output_size, decoded_bytes);
+            return 1;
+        }
+
+        total_bytes_written += fwrite (dec_buffer, 1, decoded_bytes, outfile);
+        free (enc_buffer);
+        free (dec_buffer);
+    }
+
+    if (verbose && total_bytes_written)
+        fprintf (verbose, "bytes read / written = %d / %d (%.2f%%)\n", total_bytes_read, total_bytes_written,
+            total_bytes_read * 100.0 / total_bytes_written);
 
     return 0;
+}
+
+static int decompress_buffer (unsigned char **input, int *input_size, unsigned char *output, int output_size, int use_model_only)
+{
+    unsigned char **value_lookup, *lookup_buffer, history_bits, hash_bits;
+    int flags, num_samples, history_bins, num_codes, used_bins, ptable_entries;
+    unsigned char code_xlate [256], hash_xlate [256];
+    unsigned short *summed_probabilities;
+    prob_t *probabilities;
+
+    unsigned int low = 0, high = 0xffffffff, value = 0, mult, sum_values;
+    unsigned char *outp = output;
+    int p0, p1, i;
+
+    flags = *(*input)++;
+    --*input_size;
+
+    if (flags & RLE_FLAGS) {
+        int outbytes = rle_decode (input, input_size, output, output_size);
+
+        if (flags & NUM_FLAGS)
+            convert2sums (output, outbytes);
+
+        return outbytes;
+    }
+
+    for (i = 0; i < 4; ++i)
+        ((char *) &num_samples) [i] = *(*input)++;
+
+    *input_size -= 4;
+
+    hash_bits = *(*input)++;
+    --*input_size;
+    history_bits = *(*input)++;
+    --*input_size;
+
+    if (hash_bits > 8 || hash_bits > history_bits || history_bits > MAX_HISTORY_BITS) {
+        fprintf (stderr, "fatal decoding error, hash bits = %d, history bits = %d\n", hash_bits, history_bits);
+        return -1;
+    }
+
+    if (history_bits) {
+        unsigned char num_codes_byte;
+        num_codes_byte = *(*input)++;
+        num_codes = num_codes_byte ? num_codes_byte : 256;
+        --*input_size;
+
+        for (i = 0; i < num_codes; ++i) {
+            code_xlate [i] = *(*input)++;
+            --*input_size;
+        }
+
+        for (i = 0; i < 256; ++i)
+            hash_xlate [i] = hashed_code (i, 1 << hash_bits);
+    }
+    else {
+        for (i = 0; i < 256; ++i)
+            hash_xlate [i] = code_xlate [i] = i;
+
+        num_codes = 256;
+    }
+
+    history_bins = 1 << history_bits;
+
+    int bins_mask_size = ((1 << history_bits) + 7) / 8;
+    unsigned char *bins_mask = malloc (bins_mask_size);
+    int bins_mask_decode_bytes;
+
+    if (history_bits)
+        bins_mask_decode_bytes = decompress_buffer (input, input_size, bins_mask, bins_mask_size, 0);
+    else
+        bins_mask_decode_bytes = bins_mask [0] = 1;
+
+    if (bins_mask_decode_bytes != bins_mask_size) {
+        fprintf (stderr, "fatal decoding error, bin mask size wrong, wanted %d, got %d\n",
+            bins_mask_size, bins_mask_decode_bytes);
+        return -1;
+    }
+
+    for (used_bins = i = 0; i < bins_mask_size; ++i)
+        used_bins += __builtin_popcount (bins_mask [i]);
+
+    if (used_bins > MAX_USED_BINS) {
+        fprintf (stderr, "fatal decoding error, used bins = %d\n", used_bins);
+        return -1;
+    }
+
+    ptable_entries = used_bins * num_codes;
+    summed_probabilities = malloc (sizeof (*summed_probabilities) * ptable_entries);
+    probabilities = malloc (sizeof (prob_t) * ptable_entries);
+
+    int prob_decode_bytes;
+
+    prob_decode_bytes = decompress_buffer (input, input_size, (unsigned char *) probabilities, ptable_entries * sizeof (prob_t), 0);
+
+    if (prob_decode_bytes < ptable_entries * sizeof (prob_t)) {
+        prob_t *unpared_ptable = malloc (ptable_entries * sizeof (prob_t)), *dst = unpared_ptable;
+        unsigned char *src = (unsigned char *) probabilities;
+        int next_code, unpared_size;
+
+        for (p0 = 0; p0 < history_bins; p0++)
+            if (bins_mask [p0 >> 3] & (1 << (p0 & 7)))
+                for (next_code = 0; next_code < num_codes; ++next_code) {
+                    p1 = ((p0 << hash_bits) | hash_xlate [next_code]) & (history_bins - 1);
+                    if (bins_mask [p1 >> 3] & (1 << (p1 & 7)))
+                        *dst++ = log2linear [*src++];
+                    else
+                        *dst++ = 0;
+                }
+
+        unpared_size = (int)((dst - unpared_ptable) * sizeof (prob_t));
+
+        if (prob_decode_bytes == (int)((src - (unsigned char *) probabilities) * sizeof (unsigned char)) &&
+            unpared_size == ptable_entries * sizeof (prob_t)) {
+                memcpy (probabilities, unpared_ptable, ptable_entries * sizeof (prob_t));
+                prob_decode_bytes = unpared_size;
+            }
+
+        free (unpared_ptable);
+    }
+
+    if (prob_decode_bytes != ptable_entries * sizeof (prob_t)) {
+        fprintf (stderr, "fatal decoding error, probabilities size wrong, wanted %d, got %d\n",
+            (int)(ptable_entries * sizeof (prob_t)), prob_decode_bytes);
+        return -1;
+    }
+
+    int total_summed_probabilities = 0;
+
+    for (p0 = 0; p0 < ptable_entries; ++p0)
+        total_summed_probabilities += probabilities [p0];
+
+    lookup_buffer = malloc (total_summed_probabilities);
+    value_lookup = malloc (sizeof (*value_lookup) * used_bins);
+
+    unsigned short *hist_xlate_16 = NULL;
+    unsigned int *hist_xlate_32 = NULL;
+    int hist_index = 0;
+
+    if (used_bins > 65536)
+        hist_xlate_32 = malloc (sizeof (*hist_xlate_32) * history_bins);
+    else
+        hist_xlate_16 = malloc (sizeof (*hist_xlate_16) * history_bins);
+
+    unsigned char *lb_ptr = lookup_buffer;
+
+    for (p0 = 0; p0 < history_bins; ++p0)
+        if (bins_mask [p0 >> 3] & (1 << (p0 & 7))) {
+            for (sum_values = i = 0; i < num_codes; ++i)
+                summed_probabilities [hist_index * num_codes + i] = sum_values += probabilities [hist_index * num_codes + i];
+
+            value_lookup [hist_index] = lb_ptr;
+
+            for (i = 0; i < num_codes; i++) {
+                int c = probabilities [hist_index * num_codes + i];
+
+                while (c--)
+                    *lb_ptr++ = i;
+            }
+
+            if (hist_xlate_32)
+                hist_xlate_32 [p0] = hist_index++;
+            else
+                hist_xlate_16 [p0] = hist_index++;
+        }
+
+    for (i = 4; i--;) {
+        value = (value << 8) | *(*input)++;
+        --*input_size;
+    }
+
+    free (bins_mask);
+    p0 = p1 = 0;
+
+    int scount = num_samples;
+
+    while (scount--) {
+        int bin = hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0], bindex = bin * num_codes;
+
+        mult = (high - low) / summed_probabilities [bindex + num_codes - 1];
+
+        if (!mult) {
+            for (i = 4; i--;) {
+                value = (value << 8) | *(*input)++;
+                --*input_size;
+            }
+
+            low = 0;
+            high = 0xffffffff;
+            mult = high / summed_probabilities [bindex + num_codes - 1];
+
+            if (!mult) {
+                fprintf (stderr, "fatal decoding error, mult = 0!\n");
+                return -1;
+            }
+        }
+
+        i = (value - low) / mult;
+
+        if (i >= summed_probabilities [bindex + num_codes - 1]) {
+            fprintf (stderr, "fatal decoding error, index too big!\n");
+            return -1;
+        }
+
+        if ((i = value_lookup [bin] [i]))
+            low += summed_probabilities [bindex + i - 1] * mult;
+
+        high = low + probabilities [bindex + i] * mult - 1;
+        *outp++ = code_xlate [i];
+        p0 = ((p0 << hash_bits) | hash_xlate [i]) & (history_bins - 1);
+
+        while ((high >> 24) == (low >> 24)) {
+            value = (value << 8) | *(*input)++;
+            high = (high << 8) | 0xff;
+            --*input_size;
+            low <<= 8;
+        }
+    }
+
+    if (use_model_only) {
+        static unsigned long long kernel = 0x3141592653589793;
+
+        outp = output;
+        p0 = p1 = 0;
+
+        while (num_samples--) {
+            int bin = hist_xlate_32 ? hist_xlate_32 [p0] : hist_xlate_16 [p0], bindex = bin * num_codes;
+
+            if (bin >=used_bins || !summed_probabilities [bindex + num_codes - 1]) {
+                if (hist_xlate_32)
+                    bindex = (bin = hist_xlate_32 [p0 = 0]) * num_codes;
+                else
+                    bindex = (bin = hist_xlate_16 [p0 = 0]) * num_codes;
+            }
+
+            kernel = ((kernel << 4) - kernel) ^ 1;
+            kernel = ((kernel << 4) - kernel) ^ 1;
+            kernel = ((kernel << 4) - kernel) ^ 1;
+            i = value_lookup [bin] [(unsigned int)(kernel >> 32) % summed_probabilities [bindex + num_codes - 1]];
+            *outp++ = code_xlate [i];
+            p0 = ((p0 << hash_bits) | hash_xlate [i]) & (history_bins - 1);
+        }
+    }
+
+    free (hist_xlate_32 ? (void *) hist_xlate_32 : (void *) hist_xlate_16);
+    free (summed_probabilities);
+    free (probabilities);
+    free (lookup_buffer);
+    free (value_lookup);
+
+    if (flags & NUM_FLAGS)
+        convert2sums (output, (int)(outp - output));
+
+    return outp - output;
+}
+
+static int decompress_interleave (unsigned char **input, int *input_size, unsigned char *output, int output_size, int use_model_only)
+{
+    int total_bytes_written = 0, interleave_value, i;
+
+    interleave_value = *(*input)++;
+    --*input_size;
+
+    if (interleave_value < 1 || interleave_value > 16) {
+        fprintf (stderr, "fatal decoding error, interleave = %d!\n", interleave_value);
+        return -1;
+    }
+
+    for (i = 0; i < interleave_value; ++i)
+        total_bytes_written += decompress_buffer (input, input_size, output + total_bytes_written, output_size - total_bytes_written, use_model_only);
+
+    if (interleave_value > 1)
+        interleave (output, total_bytes_written, interleave_value, NULL);
+
+    return total_bytes_written;
+}
+
+/* ---------------------------- hashing ---------------------------- */
+
+static unsigned int hashed_code (unsigned int input_code, unsigned int num_hash_values)
+{
+    return ((0 - ((input_code / num_hash_values) & 1)) ^ input_code) % num_hash_values;
+}
+
+/* ---------------------------- logrithms ---------------------------- */
+
+#define KNEE 35
+
+static void generate_log_tables (void)
+{
+    double value = MAX_PROBABILITY;
+    int straight = 0, i;
+
+    for (i = 255; i >= 0; --i) {
+        int integer = (int) floor (value + 0.5);
+
+        if (integer > i && !straight)
+            log2linear [i] = integer;
+        else {
+            log2linear [i] = i;
+            straight = 1;
+        }
+
+        // printf ("%d: %d (%.3f)\n", i, log2linear [i], value);
+        linear2log [log2linear [i]] = i;
+
+        value -= value / KNEE;
+    }
+
+    int low_log;
+
+    for (i = 1; i <= MAX_PROBABILITY; ++i)
+        if (linear2log [i])
+            low_log = linear2log [i];
+        else {
+            int low_log_error = log2linear [low_log] - i;
+            int high_log_error = log2linear [low_log + 1] - i;
+
+            if (abs (low_log_error) <= abs (high_log_error))
+                linear2log [i] = low_log;
+            else
+                linear2log [i] = low_log + 1;
+        }
+
+    double max_error = 0.0;
+    int worst_value = 0;
+
+    for (i = 0; i <= MAX_PROBABILITY; ++i)
+        if (log2linear [linear2log [i]] != i) {
+            double error = abs (log2linear [linear2log [i]] - i) / i;
+
+            if (error > max_error) {
+                max_error = error;
+                worst_value = i;
+            }
+        }
+
+    // fprintf (stderr, "max error = %d --> %d --> %d, %.2f%%\n",
+    //     worst_value, linear2log [worst_value], log2linear [linear2log [worst_value]], max_error * 100.0);
+
+    // fprintf (stderr, "ave error = %.2f%%\n", 50.0 / KNEE);
+
+    tables_generated = 1;
+}
+
+/* ---------------------------- checksum ---------------------------- */
+
+static unsigned int checksum (void *data, int bcount)
+{
+    unsigned char *dptr = data;
+    unsigned int sum = -1;
+
+    while (bcount--)
+        sum = (sum * 3) + *dptr++;
+
+    return sum;
+}
+
+/* -------------------------- Run-Length Encoder ---------------------------- */
+
+int rle_encode (void *input, int input_size, void *output)
+{
+    unsigned char *inptr = input, *outptr = output;
+    int dups, lits, bc = input_size, index = 0;
+
+    while (bc) {
+        if (bc > 1 && inptr [0] == inptr [1]) {
+            for (dups = 1; dups < 127 && bc > dups + 1 && inptr [0] == inptr [dups + 1]; dups++);
+
+            if (output) {
+                outptr [index++] = 0x80 + dups;
+                outptr [index++] = *inptr;
+            }
+            else
+                index += 2;
+
+            inptr += dups + 1;
+            bc -= dups + 1;
+        }
+        else {
+            for (lits = 1; lits < 127 && lits < bc; ++lits)
+                if (lits >= 3 && inptr [lits] == inptr [lits - 1] && inptr [lits] == inptr [lits - 2]) {
+                    lits -= 2;
+                    break;
+                }
+
+            if (output)
+                outptr [index++] = 0x00 + lits;
+            else
+                index++;
+
+            bc -= lits;
+
+            if (output)
+                while (lits--)
+                    outptr [index++] = *inptr++;
+            else {
+                index += lits;
+                inptr += lits;
+            }
+        }
+    }
+
+    if (output)
+        outptr [index++] = 0;
+    else
+        index++;
+
+    return index;
+}
+
+int rle_decode (unsigned char **input, int *input_size, void *output, int output_size)
+{
+    unsigned char *outlim = (unsigned char *) output + output_size;
+    unsigned char *outp = output;
+
+    while (*input_size && **input) {
+        if (**input & 0x80) {
+            int count = (*(*input)++ & 0x7f) + 1;
+            int value = *(*input)++;
+
+            *input_size -= 2;
+
+            if (outp + count > outlim) {
+                fprintf (stderr, "rle_decode(): output buffer too small!\n");
+                return -1;
+            }
+
+            while (count--)
+                *outp++ = value;
+        }
+        else {
+            int count = *(*input)++ & 0x7f;
+
+            if (count > --*input_size) {
+                fprintf (stderr, "rle_decode(): bytes exhausted!\n");
+                return -1;
+            }
+
+            if (outp + count > outlim) {
+                fprintf (stderr, "rle_decode(): output buffer too small!\n");
+                return -1;
+            }
+
+            while (count--) {
+                *outp++ = *(*input)++;
+                --*input_size;
+            }
+        }
+    }
+
+    if (*input_size < 1) {
+        fprintf (stderr, "rle_decode(): missing termination!\n");
+        return -1;
+    }
+
+    ++*input;
+    --*input_size;
+
+    return outp - (unsigned char *) output;
+}
+
+/* ----------------------------- interleaving ------------------------------- */
+
+static int peak_interleave (unsigned char *buffer, int num_bytes, int max_interleave, FILE *verbose)
+{
+    int interleave_factors [max_interleave+1], ave_factor = 0, max_factor, min_factor, peak, j;
+    unsigned char *ptr;
+
+    memset (interleave_factors, 0, sizeof (interleave_factors));
+
+    for (ptr = buffer; ptr < buffer + num_bytes; ++ptr) {
+        int max_len = (buffer + num_bytes - ptr - 1) / 3, n;
+
+        for (n = 1; n <= max_interleave && n < max_len; ++n)
+            if (*ptr == ptr [n] && *ptr == ptr [n+n] && *ptr == ptr [n+n+n])
+                interleave_factors [n]++;
+    }
+
+    for (peak = j = 1; j <= max_interleave; ++j) {
+        ave_factor += interleave_factors [j] = floor (interleave_factors [j] / sqrt (sqrt (j)) + 0.5);
+        if (j == 1)
+            min_factor = max_factor = interleave_factors [j];
+        else {
+            if (interleave_factors [j] > max_factor) {
+                max_factor = interleave_factors [j];
+                peak = j;
+            }
+
+            if (interleave_factors [j] < min_factor)
+                min_factor = interleave_factors [j];
+        }
+    }
+
+    if (!max_factor || peak == 1)
+        return 1;
+
+    ave_factor = (ave_factor + max_interleave - 1) / max_interleave;
+
+    if (max_factor < ave_factor * 2 || num_bytes / max_factor > 1000 ||
+        (peak == max_interleave && max_factor < interleave_factors [peak-1] * 2) ||
+        (peak < max_interleave && max_factor < interleave_factors [peak-1] + interleave_factors [peak+1]))
+            return 1;
+
+    if (verbose) {
+        char str [max_interleave*32];
+        str [0] = 0;
+
+        for (j = 1; j <= max_interleave; ++j) {
+            if (interleave_factors [j] == max_factor)
+                sprintf (str+strlen(str), " +%d+", interleave_factors [j]);
+            else if (interleave_factors [j] == min_factor)
+                sprintf (str+strlen(str), " -%d-", interleave_factors [j]);
+            else
+                sprintf (str+strlen(str), " %d", interleave_factors [j]);
+        }
+
+        fprintf (verbose, "peak_i = %d, factors =%s, ave = %d, ratio = %d\n", peak, str, ave_factor, num_bytes / max_factor);
+    }
+
+    return peak;
+}
+
+static void interleave (void *buffer, int num_bytes, int stride, void *source)
+{
+    unsigned char *bufptr = buffer, *temp, *tptr;
+    int index = 0, bc = num_bytes;
+
+    if (!source || source == buffer) {
+        tptr = temp = malloc (num_bytes);
+        memcpy (temp, bufptr, num_bytes);
+    }
+    else
+        tptr = source;
+
+    while (bc--) {
+        bufptr [index] = *tptr++;
+        if ((index += stride) >= num_bytes)
+            index = (index % stride) + 1;
+    }
+
+    if (!source || source == buffer)
+        free (temp);
+}
+
+static void deinterleave (void *buffer, int num_bytes, int stride, void *source)
+{
+    unsigned char *bufptr = buffer, *temp;
+    int index = 0, bc = num_bytes;
+
+    if (!source || source == buffer) {
+        temp = malloc (num_bytes);
+        memcpy (temp, buffer, num_bytes);
+    }
+    else temp = source;
+
+    while (bc--) {
+        *bufptr++ = temp [index];
+        if ((index += stride) >= num_bytes)
+            index = (index % stride) + 1;
+    }
+
+    if (!source || source == buffer)
+        free (temp);
+}
+
+/* ----------------------------- numeric delta ------------------------------- */
+
+static void convert2deltas (void *buffer, int byte_count)
+{
+    if (byte_count > 1) {
+        unsigned char *bptr = buffer, last = 0;
+        int bc = byte_count;
+
+        while (bc--)
+            last += *bptr++ -= last;
+    }
+}
+
+static void convert2sums (void *buffer, int byte_count)
+{
+    if (byte_count > 1) {
+        unsigned char *bptr = buffer, sum = 0;
+        int bc = byte_count;
+
+        while (bc--)
+            sum = *bptr++ += sum;
+    }
 }
