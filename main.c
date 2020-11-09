@@ -141,7 +141,7 @@ int main (argc, argv) int argc; char **argv;
 
                     case 'T': case 't':
                         if (!block_size_override)
-                            block_size = MIN_BLOCK_SIZE;
+                            block_size = 1000000;
 
                         if (!history_depth_override)
                             history_depth = 3;
