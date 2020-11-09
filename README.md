@@ -40,7 +40,7 @@ xz         | 1,186,180
 ppmd       | 1,138,541
 newpack    | 1,124,601
 
-Another file it performs the best on is the first billion digits of pi text file found on the web. This file is interesting for two reasons. First, because the digits of pi are uncorrelated we shouldn't benefit from any history and should simply utilize symbol frequency (and we do). Also, because of this, it's possible to accurately calculate the maximum compression possible using the formula `10^9 * log (10) / log (256)` (ignoring the case where the decompressors actually calculates pi):
+Another file it performs the best on is the first billion digits of pi text file found on the web. This file is interesting for two reasons. First, because the digits of pi are uncorrelated we shouldn't benefit from any history and should simply utilize symbol frequency (and we do). Also, because of this, it's possible to accurately calculate the maximum compression possible using the formula `10^9 * log (10) / log (256)` (ignoring the case where the decompressor actually calculates pi):
 
 Compressor | Compressed Size
 -----------|----------------
@@ -69,7 +69,7 @@ bzip2      | 4,051,112
 ppmd       | 4,024,809
 newpack    | 3,967,934
 
-Uncompressed images often compress very well with newpack. Here's a personal RGB image preprocessed using numeric mode (-nn):
+Uncompressed images often compress very well with newpack. Here's a personal RGB image `Mendocino.bmp` preprocessed using forced numeric mode (-nn):
 
 Compressor | Compressed Size
 -----------|----------------
