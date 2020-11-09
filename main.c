@@ -22,7 +22,7 @@
 #define HISTORY_DEPTH_DEFAULT 5
 #define MAX_BLOCK_SIZE 100000000
 #define DEF_BLOCK_SIZE 20000000
-#define MIN_BLOCK_SIZE 1000000
+#define MIN_BLOCK_SIZE 100000
 
 static const char *usage = "\n"
 " NEWPACK  Experimental General-Purpose Lossless Compressor  Version 0.0.2\n"
@@ -36,7 +36,8 @@ static const char *usage = "\n"
 "          -e     = exhaustive search (very slow for very little gain)\n"
 "          -i     = automatically detect interleave and use if better\n"
 "          -i<n>  = force specified interleave stride (1-16, default = 1)\n"
-"          -b<n>  = specify block size (1 MB - 100 MB, default = 20 MB)\n"
+"          -b<n>  = specify block size (1 - 100 MB or 100000+ bytes,\n"
+"                   default = 20 MB, does not override history depth\n"
 "          -l     = use long blocks (100 MB; history depth set to -6)\n"
 "          -s     = use short blocks (4 MB; history depth set to -4)\n"
 "          -t     = use tiny blocks (1 MB; history depth set to -3)\n"
@@ -103,7 +104,7 @@ int main (argc, argv) int argc; char **argv;
                             block_size *= 1000000;
 
                         if (block_size < MIN_BLOCK_SIZE || block_size > MAX_BLOCK_SIZE) {
-                            fprintf (stderr, "block size must be 1MB - 100MB\n");
+                            fprintf (stderr, "block size must be 1 - 100 MB or 100000+ bytes\n");
                             ++error_count;
                         }
 
